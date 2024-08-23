@@ -1,12 +1,14 @@
 import logging
 import mimetypes
 import os
+import time
 import uuid
 from datetime import datetime
 from urllib.parse import urlparse
 
 import stripe
-from flask import Blueprint, jsonify, request, current_app as app
+from firebase_admin import messaging
+from flask import Blueprint, jsonify, request, current_app as app, Response, redirect, url_for
 from flask_bcrypt import generate_password_hash
 from flask_jwt_extended import jwt_required, get_jwt_identity, create_access_token
 import requests  # Standard requests library
@@ -14,13 +16,315 @@ from google.oauth2 import id_token
 from google.auth.transport.requests import Request as GoogleRequest
 from werkzeug.utils import secure_filename
 
-from .extensions import db
-from .models import User, MarketplaceItem, Payment, Order, SalesTransaction, File
+from . import db
+from .models import User, MarketplaceItem, Payment, Order, SalesTransaction, File, Review
+from .utils import on_item_sold, send_fcm_message, send_chat_message_notification
 
 api_bp = Blueprint('api', __name__)
 
 UPLOAD_FOLDER = 'Uploads'
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
+
+
+@api_bp.route('/delete-account', methods=['DELETE'])
+@jwt_required()
+def delete_account():
+    """Delete a connected Stripe account."""
+    try:
+        # Get the current user's ID from the JWT token
+        user_id = get_jwt_identity()
+        logging.info(f"User ID from JWT: {user_id}")
+
+        # Fetch the user from the database
+        user = User.query.get(user_id)
+        if not user:
+            logging.error("User not found")
+            return jsonify({"error": "User not found"}), 404
+
+        # Ensure the user has a Stripe account ID
+        if not user.stripe_account_id:
+            logging.error("User does not have a Stripe account")
+            return jsonify({"error": "User does not have a Stripe account"}), 400
+
+        # Delete the Stripe account
+        deleted_account = stripe.Account.delete(user.stripe_account_id)
+        logging.info(f"Stripe account deleted: {deleted_account.id}")
+
+        # Remove the Stripe account ID from the user record
+        user.stripe_account_id = None
+        db.session.commit()
+
+        return jsonify(
+            {"message": "Stripe account deleted successfully", "deleted_account_id": deleted_account.id}), 200
+
+    except Exception as e:
+        logging.error('An error occurred when deleting the Stripe account: %s', e, exc_info=True)
+        return jsonify(error=str(e)), 500
+
+
+@api_bp.route('/transfer', methods=['POST'])
+@jwt_required()
+def create_transfer():
+    """Initiate a transfer to a connected account using the user's account balance."""
+    try:
+        data = request.json
+        account_id = data.get('account_id')
+        currency = data.get('currency', 'usd')
+
+        if not account_id:
+            return jsonify({"error": "Account ID is required"}), 400
+
+        # Ensure the user has an account balance for the transfer
+        current_user_id = get_jwt_identity()
+        user = User.query.get(current_user_id)
+        if not user:
+            return jsonify({"error": "User not found"}), 404
+
+        if user.account_balance <= 0:
+            return jsonify({"error": "Insufficient balance"}), 400
+
+        # Create a transfer to the connected account using the user's account balance
+        transfer = stripe.Transfer.create(
+            amount=int(user.account_balance * 100),  # Convert to the smallest currency unit (e.g., cents)
+            currency=currency,
+            destination=account_id,
+            transfer_group='ORDER123',  # Optional: A unique string to group the transfer with a payment or other object
+        )
+
+        # Deduct the amount from the user's balance
+        user.account_balance = 0  # Optionally, you could set this to a smaller value if partial balance transfers are allowed
+        db.session.commit()
+
+        return jsonify({'transfer': transfer.id})
+    except Exception as e:
+        logging.error('An error occurred when creating the transfer: ', exc_info=True)
+        return jsonify(error=str(e)), 500
+
+
+@api_bp.route('/refresh/<account_id>', methods=['GET'])
+def refresh_account_link(account_id):
+    """Refresh the Stripe account link."""
+    try:
+        # Create a new account link
+        account_link = stripe.AccountLink.create(
+            account=account_id,
+            return_url=f"http://localhost:4242/return/{account_id}",
+            refresh_url=f"http://localhost:5001/refresh/{account_id}",
+            type="account_onboarding",
+        )
+
+        # Redirect the user to the new account link URL
+        return redirect(account_link.url)
+
+    except Exception as e:
+        logging.error('An error occurred when refreshing the Stripe account link: ', exc_info=True)
+        return Response(f"Error: {str(e)}", content_type='text/plain', status=500)
+
+
+@api_bp.route('/account', methods=['GET'])
+@jwt_required()
+def get_stripe_account():
+    try:
+        # Get the current user from the database
+        user_id = get_jwt_identity()
+        user = User.query.get(user_id)
+
+        if not user or not user.stripe_account_id:
+            return jsonify({"error": "User not found or no associated Stripe account"}), 404
+
+        # Retrieve the Stripe account using the stored account ID
+        account = stripe.Account.retrieve(user.stripe_account_id)
+
+        # Extract the necessary fields to check onboarding status
+        charges_enabled = account.get('charges_enabled', False)
+        details_submitted = account.get('details_submitted', False)
+
+        # Send the relevant account information to the frontend
+        return jsonify({
+            "stripe_account_id": account.id,
+            "charges_enabled": charges_enabled,
+            "details_submitted": details_submitted
+        }), 200
+
+    except stripe.error.StripeError as e:
+        # Handle Stripe-specific errors
+        return jsonify({"error": str(e)}), 500
+
+    except Exception as e:
+        # Handle other errors
+        return jsonify({"error": str(e)}), 500
+
+
+@api_bp.route('/account', methods=['POST'])
+@jwt_required()
+def create_account():
+    try:
+        logging.debug("Request Headers: %s", request.headers)
+        logging.debug("Request Data: %s", request.get_json())
+
+        # Extract the necessary data from the request body
+        data = request.get_json()
+
+        # Extracting data with default values if not provided
+        country = data.get('country', 'US')
+        email = data.get('email')
+        business_type = data.get('business_type')
+        company = data.get('company', {})
+        individual = data.get('individual', {})
+
+        # Prepare the individual dictionary if business_type is 'individual'
+        if business_type == "individual":
+            individual_data = {
+                "address": {
+                    "city": individual.get("address", {}).get("city"),
+                    "country": individual.get("address", {}).get("country"),
+                    "line1": individual.get("address", {}).get("line1"),
+                    "line2": individual.get("address", {}).get("line2"),
+                    "postal_code": individual.get("address", {}).get("postal_code"),
+                    "state": individual.get("address", {}).get("state"),
+                },
+                "dob": {
+                    "day": individual.get("dob", {}).get("day"),
+                    "month": individual.get("dob", {}).get("month"),
+                    "year": individual.get("dob", {}).get("year"),
+                },
+                "email": individual.get("email"),
+                "first_name": individual.get("first_name"),
+                "last_name": individual.get("last_name"),
+                "phone": individual.get("phone"),
+                # Add any other fields as necessary
+            }
+
+        else:
+            individual_data = {}
+
+        # Create a Stripe account with the selected country and other prefilled information
+        account = stripe.Account.create(
+            controller={
+                "fees": {"payer": "application"},
+                "losses": {"payments": "application"},
+                "stripe_dashboard": {"type": "express"},
+            },
+            capabilities={
+                "card_payments": {"requested": True},
+                "transfers": {"requested": True}
+            },
+            country=country,
+            email=email,
+            business_type=business_type,
+            company=company,
+            individual=individual_data,  # Pass the individual data
+
+        )
+
+        logging.info("Stripe account created: %s", account.id)
+
+        # Get the current user from the database
+        user_id = get_jwt_identity()
+        user = User.query.get(user_id)
+        if not user:
+            return jsonify({"error": "User not found"}), 404
+
+        # Save the Stripe account ID to the user record
+        user.stripe_account_id = account.id
+        db.session.commit()
+
+        return jsonify({
+            'stripe_account_id': account.id,
+            'email': account.email,
+            'country': account.country
+        })
+
+    except Exception as e:
+        logging.error('An error occurred when calling the Stripe API to create an account: %s', e, exc_info=True)
+        return jsonify(error=str(e)), 500
+
+
+@api_bp.route('/account/<account>', methods=['POST'])
+def update_account(account):
+    try:
+        connected_account = stripe.Account.modify(
+            account,
+            business_type="individual",
+        )
+
+        return jsonify({
+            'account': connected_account.id,
+        })
+    except Exception as e:
+        print('An error occurred when calling the Stripe API to update an account: ', e)
+        return jsonify(error=str(e)), 500
+
+
+@api_bp.route('/account_link', methods=['POST'])
+@jwt_required()
+def create_account_link():
+    """Create a Stripe account link for onboarding."""
+    try:
+        data = request.get_json()
+        connected_account_id = data.get('account')
+
+        if not connected_account_id:
+            return jsonify({"error": "Account ID is required"}), 400
+
+        return_url = f"http://localhost:4242/return/{connected_account_id}"
+        refresh_url = f"http://192.168.0.22:5001/refresh/{connected_account_id}"
+
+        account_link = stripe.AccountLink.create(
+            account=connected_account_id,
+            return_url=return_url,
+            refresh_url=refresh_url,
+            type="account_onboarding",
+        )
+
+        if account_link.url == refresh_url:
+            # Perform different action if refresh URL is returned
+            logging.warning('Stripe returned the refresh URL, indicating the account link process was incomplete.')
+            return jsonify({
+                'message': 'Account link process was incomplete. Please try again.',
+                'refresh_url': refresh_url,
+            }), 202
+
+        # Otherwise, return the normal account link URL
+        return jsonify({
+            'url': account_link.url,
+        })
+    except Exception as e:
+        logging.error('An error occurred when calling the Stripe API to create an account link: ', exc_info=True)
+        return jsonify(error=str(e)), 500
+
+
+@api_bp.route('/payout', methods=['POST'])
+@jwt_required()
+def create_payout():
+    """Initiate a payout to a connected account."""
+    try:
+        data = request.json
+        account_id = data.get('account_id')
+        amount = data.get('amount')
+        currency = data.get('currency', 'usd')
+
+        # Ensure the user has enough balance for the payout
+        current_user_id = get_jwt_identity()
+        user = User.query.get(current_user_id)
+        if user.account_balance < amount:
+            return jsonify({"error": "Insufficient balance"}), 400
+
+        # Create a payout to the connected account
+        payout = stripe.Payout.create(
+            amount=int(amount),
+            currency=currency,
+            stripe_account=account_id,
+        )
+
+        # Deduct the amount from the user's balance
+        user.account_balance -= amount
+        db.session.commit()
+
+        return jsonify({'payout': payout.id})
+    except Exception as e:
+        logging.error('An error occurred when creating the payout: ', exc_info=True)
+        return jsonify(error=str(e)), 500
 
 
 @api_bp.route('/payment-success', methods=['POST'])
@@ -38,6 +342,7 @@ def handle_payment_success():
         # Extract the list of items and total amount
         items = data['items']
         total_amount = data['total_amount']
+        fcm_token = data['fcm_token']  # Extract FCM token
 
         # Check if items is a list and not empty
         if not isinstance(items, list) or not items:
@@ -100,6 +405,9 @@ def handle_payment_success():
                 seller.account_balance += seller_share
                 app.logger.info(f"Updated seller {seller.email} balance by {seller_share}")
 
+                if fcm_token:
+                    on_item_sold(marketplace_item.userId, marketplace_item.name)
+
         # Commit all transactions at once
         db.session.commit()
 
@@ -118,8 +426,8 @@ def payment_sheet():
     publishable_key = os.getenv('PK_TEST')
     api_key = os.getenv('API_KEY')
     stripe.api_key = api_key
-    user = User.query.get(current_user_id)
 
+    user = User.query.get(current_user_id)
     if not user:
         return jsonify({"error": "User not found"}), 404
 
@@ -130,20 +438,46 @@ def payment_sheet():
     else:
         customer = stripe.Customer.retrieve(user.stripe_customer_id)
 
-    ephemeralKey = stripe.EphemeralKey.create(
-        customer=customer.id,
-        stripe_version='2020-08-27'
-    )
-
+    # Retrieve amount, currency, and item ID from the request
     amount = request.json.get('amount')
     currency = request.json.get('currency')
-    print(f"Received amount: {amount}, currency: {currency}")
+    item_id = request.json.get('item_id')
+    print(f"Received amount: {amount}, currency: {currency}, item_id: {item_id}")
+
+    print(f"Received item_id: {item_id}")
+    marketplace_item = MarketplaceItem.query.get(item_id)
+    if marketplace_item:
+        print(f"Found marketplace item: {marketplace_item.name}")
+    else:
+        print(f"No marketplace item found with id: {item_id}")
+
+    seller = User.query.get(marketplace_item.userId)
+    if not seller or not seller.stripe_account_id:
+        return jsonify({"error": "Seller not found or not connected to Stripe"}), 404
+
+    # Calculate platform fee (e.g., 10% of the amount)
+    platform_fee_percentage = 10
+    platform_fee_amount = int(amount * platform_fee_percentage / 100)
+
+    # Calculate the amount to be transferred to the seller
+    transfer_amount = amount - platform_fee_amount
 
     paymentIntent = stripe.PaymentIntent.create(
-        amount=amount,
+        amount=amount,  # The total amount to be charged to the customer
         currency=currency,
         customer=customer.id,
-        automatic_payment_methods={'enabled': True}
+        automatic_payment_methods={'enabled': True},
+        transfer_data={
+            'destination': seller.stripe_account_id
+        },
+        application_fee_amount=platform_fee_amount,  # Specify the platform fee
+        on_behalf_of=seller.stripe_account_id  # Optional: for showing seller's details on the statement
+    )
+
+    # Create the ephemeral key
+    ephemeralKey = stripe.EphemeralKey.create(
+        customer=customer.id,
+        stripe_version='2022-11-15'  # Use a more recent version if necessary
     )
 
     return jsonify({
@@ -154,10 +488,39 @@ def payment_sheet():
     }), 200
 
 
+@api_bp.route('/get_fcm_token', methods=['GET'])
+@jwt_required()
+def get_fcm_token():
+    try:
+        # Get the current user's ID from the JWT token
+        user_id = get_jwt_identity()
+        logging.info(f"User ID from JWT: {user_id}")
+
+        # Fetch the user from the database
+        user = User.query.get(user_id)
+        if not user:
+            logging.error("User not found")
+            return jsonify({"error": "User not found"}), 404
+
+        # Ensure the user has an FCM token
+        if not user.fcm_token:
+            logging.error("User does not have an FCM token")
+            return jsonify({"error": "User does not have an FCM token"}), 400
+
+        return jsonify({"fcm_token": user.fcm_token}), 200
+
+    except Exception as e:
+        logging.error('An error occurred when retrieving the FCM token: %s', e, exc_info=True)
+        return jsonify(error=str(e)), 500
+
+
 @api_bp.route('/signup', methods=['POST'])
-def signup():
+def signup_with_google_token():
     data = request.json
+    logging.debug(f"Received data: {data}")
     google_token = data.get('google_token')
+    fcm_token = data.get('fcm_token')
+    firebase_user_id = data.get('firebase_user_id')  # Extract the Firebase user ID
 
     if not google_token:
         return jsonify({"message": "Missing Google token", "success": False}), 400
@@ -183,17 +546,26 @@ def signup():
                 email=email,
                 username=email.split('@')[0],
                 google_id=google_id,
-                password_hash=password_hash
+                password_hash=password_hash,
+                fcm_token=fcm_token  # Save the FCM token
             )
             db.session.add(user)
-            db.session.commit()
+        else:
+            # Update FCM token for existing user
+            user.fcm_token = fcm_token
+
+        # Optionally update Firebase user ID if needed
+        if firebase_user_id:
+            user.firebase_user_id = firebase_user_id  # Assuming you have this field
 
         # Create or retrieve Stripe customer ID
         stripe.api_key = os.getenv('API_KEY')
         if not user.stripe_customer_id:
             customer = stripe.Customer.create(email=email)
             user.stripe_customer_id = customer.id
-            db.session.commit()
+
+        # Commit the transaction
+        db.session.commit()
 
         # Create a fresh access token
         access_token = create_access_token(identity=user.id)
@@ -208,6 +580,58 @@ def signup():
         logging.error(f"Failed to create or update user: {str(e)}")
         db.session.rollback()
         return jsonify({"message": "Failed to create or update user", "error": str(e), "success": False}), 500
+
+
+@api_bp.route('/login')
+def get_google_auth_url():
+    google_client_id = os.getenv('GOOGLE_CLIENT_ID')
+    redirect_uri = url_for('google_auth_callback', _external=True)  # Callback URI
+    scope = "https://www.googleapis.com/auth/userinfo.profile https://www.googleapis.com/auth/userinfo.email"
+    auth_url = (
+        f"https://accounts.google.com/o/oauth2/v2/auth?response_type=code"
+        f"&client_id={google_client_id}&redirect_uri={redirect_uri}&scope={scope}"
+    )
+    return redirect(auth_url)
+
+
+@api_bp.route('/auth/callback')
+def google_auth_callback():
+    google_client_id = os.getenv('GOOGLE_CLIENT_ID')
+    google_client_secret = os.getenv('GOOGLE_CLIENT_SECRET')
+    redirect_uri = url_for('google_auth_callback', _external=True)
+    code = request.args.get('code')
+
+    if not code:
+        return jsonify({"message": "Missing authorization code", "success": False}), 400
+
+    # Exchange authorization code for access token
+    token_url = "https://oauth2.googleapis.com/token"
+    token_data = {
+        "code": code,
+        "client_id": google_client_id,
+        "client_secret": google_client_secret,
+        "redirect_uri": redirect_uri,
+        "grant_type": "authorization_code"
+    }
+
+    try:
+        token_response = requests.post(token_url, data=token_data)
+        token_response_data = token_response.json()
+
+        if "error" in token_response_data:
+            return jsonify({"message": "Error obtaining access token", "error": token_response_data['error'],
+                            "success": False}), 400
+
+        access_token = token_response_data.get('access_token')
+        google_token = token_response_data.get('id_token')  # ID token if needed
+
+        # Now, use the access token or ID token for further operations (e.g., fetching user profile)
+        # For example, call the signup function or return tokens
+        return signup_with_google_token(google_token=google_token)
+
+    except Exception as e:
+        logging.error(f"Failed to exchange authorization code: {str(e)}")
+        return jsonify({"message": "Failed to exchange authorization code", "error": str(e), "success": False}), 500
 
 
 def sanitize_filename(url, response):
@@ -305,7 +729,8 @@ def add_marketplace_item():
             userName=user.username,
             userEmail=user.email,
             rating=data.get('rating'),
-            reviewsCount=data.get('reviewsCount')
+            reviewsCount=data.get('reviewsCount'),
+            language=data.get('language')
         )
         db.session.add(new_item)
         db.session.commit()
@@ -345,7 +770,7 @@ def get_user_orders():
 
         for item in items:
             item_dict[item.id] = {
-                "item_id": item.id,
+                "id": item.id,  # Ensure 'id' is included
                 "name": item.name,
                 "description": item.description,
                 "url": item.url,
@@ -367,7 +792,8 @@ def get_user_orders():
                 "userName": item.userName,
                 "userEmail": item.userEmail,
                 "rating": item.rating,
-                "reviewsCount": item.reviewsCount
+                "reviewsCount": item.reviewsCount,
+                "language": item.language,  # Added the language field here
             }
 
         # Iterate through orders and payments to build the response
@@ -426,4 +852,180 @@ def get_sales_transactions():
 
     except Exception as e:
         app.logger.error(f"Failed to fetch sales transactions: {e}", exc_info=True)
+        return jsonify({"error": "Internal server error"}), 500
+
+
+@api_bp.route('/item_sold/<user_fcm_token>/<item_name>', methods=['GET'])
+def item_sold(user_fcm_token, item_name):
+    try:
+        on_item_sold(user_fcm_token, item_name)
+        return jsonify({"message": "Notification sent!"}), 200
+    except Exception as e:
+        logging.error(f"Failed to send notification: {e}", exc_info=True)
+        return jsonify({"error": "Failed to send notification", "details": str(e)}), 500
+
+
+@api_bp.route('/update_fcm_token', methods=['POST'])
+@jwt_required()
+def update_fcm_token():
+    try:
+        # Get the current user's ID from the JWT token
+        user_id = get_jwt_identity()
+        logging.info(f"User ID from JWT: {user_id}")
+
+        # Fetch the user from the database
+        user = User.query.get(user_id)
+        if not user:
+            logging.error("User not found")
+            return jsonify({"error": "User not found"}), 404
+
+        # Get the FCM token from the request body
+        data = request.get_json()
+        fcm_token = data.get("fcm_token")
+
+        if not fcm_token:
+            logging.error("No FCM token provided")
+            return jsonify({"error": "No FCM token provided"}), 400
+
+        # Update the user's FCM token in the database
+        user.fcm_token = fcm_token
+        db.session.commit()
+
+        logging.info(f"FCM token updated for user {user_id}")
+        return jsonify({"message": "FCM token updated successfully"}), 200
+
+    except Exception as e:
+        logging.error('An error occurred when updating the FCM token: %s', e, exc_info=True)
+        return jsonify(error=str(e)), 500
+
+
+@api_bp.route('/api/sendFriendRequestNotification', methods=['POST'])
+@jwt_required()
+def send_friend_request_notification():
+    # Get the identity of the current user (from the JWT token)
+    current_user = get_jwt_identity()
+
+    data = request.get_json()
+    receiver_id = data.get('receiver_id')
+    sender_name = data.get('sender_name')
+
+    # Retrieve receiver's user record from the database based on firebase_user_id
+    user = User.query.filter_by(firebase_user_id=receiver_id).first()
+
+    if user is None:
+        logging.error(f"User with Firebase User ID {receiver_id} not found.")
+        return jsonify({"status": "error", "message": "User not found"}), 404
+
+    receiver_fcm_token = user.fcm_token
+
+    if receiver_fcm_token:
+        try:
+            # Use the send_fcm_message function
+            send_fcm_message(
+                token=receiver_fcm_token,
+                title="New Friend Request",
+                body=f"{sender_name} has sent you a friend request.",
+                notification_type="friend_request"
+            )
+            return jsonify({"status": "success", "message": "Notification sent successfully"}), 200
+        except Exception as e:
+            logging.error(f"Error sending FCM notification: {str(e)}")
+            return jsonify({"status": "error", "message": str(e)}), 500
+    else:
+        logging.error(f"FCM token not found for user with Firebase User ID {receiver_id}.")
+        return jsonify({"status": "error", "message": "FCM token not found"}), 404
+
+
+@api_bp.route('/api/sendChatMessageNotification', methods=['POST'])
+@jwt_required()
+def send_chat_message_notification_endpoint():
+    # Get the identity of the current user (from the JWT token)
+    current_user = get_jwt_identity()
+
+    data = request.get_json()
+    receiver_id = data.get('receiver_id')
+    sender_name = data.get('sender_name')
+    message = data.get('message')
+    chat_id = data.get('chat_id')  # Optional field
+
+    # Retrieve receiver's user record from the database based on firebase_user_id
+    user = User.query.filter_by(firebase_user_id=receiver_id).first()
+
+    if user is None:
+        logging.error(f"User with Firebase User ID {receiver_id} not found.")
+        return jsonify({"status": "error", "message": "User not found"}), 404
+
+    receiver_fcm_token = user.fcm_token
+
+    if receiver_fcm_token:
+        try:
+            # Use the send_chat_message_notification function
+            send_chat_message_notification(
+                receiver_fcm_token=receiver_fcm_token,
+                sender_name=sender_name,
+                message_text=message,
+                chat_id=chat_id  # Pass the chat_id if available
+            )
+            return jsonify({"status": "success", "message": "Notification sent successfully"}), 200
+        except Exception as e:
+            logging.error(f"Error sending FCM notification: {str(e)}")
+            return jsonify({"status": "error", "message": str(e)}), 500
+    else:
+        logging.error(f"FCM token not found for user with Firebase User ID {receiver_id}.")
+        return jsonify({"status": "error", "message": "FCM token not found"}), 404
+
+
+@api_bp.route('/api/submitReview', methods=['POST'])
+@jwt_required()
+def submit_review():
+    # Get the identity of the current user from the JWT token
+    current_user_id = get_jwt_identity()
+
+    # Parse JSON data from the request body
+    data = request.get_json()
+    marketplace_item_id = data.get('marketplace_item_id')
+    rating = data.get('rating')
+    comment = data.get('comment')
+
+    # Validate the input
+    if not marketplace_item_id or rating is None:
+        return jsonify({"status": "error", "message": "Missing required fields"}), 400
+
+    # Ensure the rating is within the valid range
+    if rating < 0 or rating > 5:
+        return jsonify({"status": "error", "message": "Invalid rating"}), 400
+
+    # Retrieve the current user
+    user = User.query.filter_by(id=current_user_id).first()
+    if user is None:
+        return jsonify({"status": "error", "message": "User not found"}), 404
+
+    # Retrieve the marketplace item
+    item = MarketplaceItem.query.get(marketplace_item_id)
+    if item is None:
+        return jsonify({"status": "error", "message": "Item not found"}), 404
+
+    # Create and save the review
+    review = Review(
+        marketplace_item_id=marketplace_item_id,
+        user_id=current_user_id,
+        rating=rating,
+        comment=comment
+    )
+
+    db.session.add(review)
+    db.session.commit()
+
+    return jsonify({"status": "success", "message": "Review submitted successfully"}), 201
+
+
+@api_bp.route('/refresh-token', methods=['POST'])
+@jwt_required(refresh=True)
+def refresh_token():
+    try:
+        current_user = get_jwt_identity()
+        new_token = create_access_token(identity=current_user, fresh=False)  # Or your preferred way to create a new token
+        return jsonify({"token": new_token}), 200
+    except Exception as e:
+        app.logger.error(f"Failed to refresh token: {e}", exc_info=True)
         return jsonify({"error": "Internal server error"}), 500

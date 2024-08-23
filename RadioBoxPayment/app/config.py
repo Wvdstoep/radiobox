@@ -1,4 +1,5 @@
 import os
+from datetime import timedelta
 
 
 class Config:
@@ -7,4 +8,6 @@ class Config:
     SQLALCHEMY_DATABASE_URI = 'sqlite:///tasks.db'
     SQLALCHEMY_TRACK_MODIFICATIONS = False
     JWT_SECRET_KEY = 'JWT_SECRET_KEY'
+    JWT_ACCESS_TOKEN_EXPIRES = timedelta(hours=4)  # Access token expiration time
+    JWT_REFRESH_TOKEN_EXPIRES = timedelta(days=30)
     AUDIO_FILES_DIRECTORY = os.path.join(PARENT_DIR, 'audio')  # Path to the audio directory

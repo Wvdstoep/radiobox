@@ -9,6 +9,7 @@ class User(db.Model):
     username = db.Column(db.String(80), unique=True, nullable=False)
     email = db.Column(db.String(120), unique=True, nullable=False)
     google_id = db.Column(db.String(120), unique=True)
+    firebase_user_id = db.Column(db.String(120), unique=True, nullable=True)  # New field for Firebase User ID
     full_name = db.Column(db.String(100), nullable=True)
     date_of_birth = db.Column(db.Date, nullable=True)
     bio = db.Column(db.String(255), nullable=True)
@@ -17,7 +18,8 @@ class User(db.Model):
     marketplace_items = db.relationship('MarketplaceItem', backref='user', lazy=True)
     orders = db.relationship('Order', backref='user', lazy=True)
     account_balance = db.Column(db.Float, default=0.0)  # New field for account balance
-
+    stripe_account_id = db.Column(db.String(128), unique=True, nullable=True)  # New field for Stripe Account ID
+    fcm_token = db.Column(db.String(255), nullable=True)  # New field for FCM token
 
 
 class MarketplaceItem(db.Model):
@@ -45,6 +47,7 @@ class MarketplaceItem(db.Model):
     userEmail = db.Column(db.String, nullable=False)
     rating = db.Column(db.Float, nullable=True)
     reviewsCount = db.Column(db.Integer, nullable=True)
+    language = db.Column(db.String, nullable=True)  # New field for language
     payments = db.relationship('Payment', backref='marketplace_item', lazy=True)
 
 
@@ -89,6 +92,7 @@ class File(db.Model):
     user_id = db.Column(db.Integer, db.ForeignKey('users.id'), nullable=False)
     marketplace_item_id = db.Column(db.String, db.ForeignKey('marketplace_items.id'), nullable=False)
     uploaded_at = db.Column(db.DateTime, default=datetime.utcnow)
+
 
 class Review(db.Model):
     __tablename__ = 'reviews'
